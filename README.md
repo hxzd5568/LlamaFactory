@@ -691,6 +691,191 @@ See [examples/README.md](examples/README.md) for advanced usage (including distr
 >
 > Read [FAQs](https://github.com/hiyouga/LlamaFactory/issues/4614) first if you encounter any problems.
 
+### Call Chain
+
+This section traces the call chain from the CLI command down to the actual model training, using a DeepSpeed ZeRO-3 LoRA SFT run as the example:
+
+```bash
+export HF_DATASETS_CACHE="/home/aisys/work/code/llamafactory_20260828/datasets/huggingface/datasets"
+llamafactory-cli train llamafactory-example/examples/train_lora/qwen2.5-7b_lora_sft_ds3.yaml
+```
+
+(The equivalent in-repo config is [examples/train_lora/qwen3_lora_sft_ds3.yaml](examples/train_lora/qwen3_lora_sft_ds3.yaml), which points to [examples/deepspeed/ds_z3_config.json](examples/deepspeed/ds_z3_config.json).)
+
+```text
+llamafactory-cli train <yaml>
+└─ src/llamafactory/cli.py:main()                          # console entry point
+   └─ src/llamafactory/launcher.py:launch()
+      ├─ multi-GPU: re-invoke via torchrun (nproc_per_node = device count)
+      │  └─ each rank re-enters launcher.py → run_exp() (line 182)
+      └─ src/llamafactory/train/tuner.py:run_exp()          # single process entry
+         ├─ hparams/parser.py:read_args()                   # load YAML with OmegaConf
+         │    deepspeed: examples/deepspeed/ds_z3_config.json → TrainingArguments
+         └─ tuner.py:_training_function()
+            ├─ hparams/parser.py:get_train_args()           # HfArgumentParser
+            │    → ModelArguments / DataArguments / TrainingArguments /
+            │      FinetuningArguments / GeneratingArguments dataclasses
+            │    → validates deepspeed installed & parallel_mode == DISTRIBUTED
+            │    → builds callbacks (LogCallback, PissaConvertCallback, ReporterCallback)
+            ├─ stage == "sft" → train/sft/workflow.py:run_sft()
+            │    ├─ model/loader.py:load_tokenizer()        # tokenizer + template (qwen3_nothink)
+            │    ├─ data/loader.py:get_dataset()            # load & tokenize datasets
+            │    │    (honors HF_DATASETS_CACHE via the HuggingFace datasets library)
+            │    ├─ model/loader.py:load_model()            # AutoModelForCausalLM.from_pretrained
+            │    │    └─ model/adapter.py:init_adapter()    # attach PEFT LoRA (rank 8, all targets)
+            │    └─ train/sft/trainer.py:CustomSeq2SeqTrainer(Seq2SeqTrainer)
+            └─ workflow.py:trainer.train()
+                 ├─ transformers Trainer reads args.deepspeed
+                 │    → HfTrainerDeepSpeedConfig loads ds_z3_config.json (ZeRO-3, bf16 "auto")
+                 ├─ accelerate Accelerator with DeepSpeedPlugin
+                 │    → deepspeed.initialize() wraps model / optimizer / scheduler
+                 │      into the DeepSpeed ZeRO-3 engine
+                 └─ training loop: forward → loss → engine.backward() → engine.step()
+                      → save_model() saves the LoRA adapter
+```
+
+Key touchpoints:
+
+| Step | File | Role |
+|------|------|------|
+| Entry | `src/llamafactory/cli.py` | Console script `main()` → `launcher.launch()` |
+| Distribution | `src/llamafactory/launcher.py` | Re-launches with `torchrun` when >1 GPU; each rank runs `run_exp()` |
+| Orchestration | `src/llamafactory/train/tuner.py` | `run_exp()` → `_training_function()`, dispatch by `finetuning_args.stage` |
+| Config parsing | `src/llamafactory/hparams/parser.py` | `read_args()` + `get_train_args()` → 5 typed argument dataclasses |
+| SFT workflow | `src/llamafactory/train/sft/workflow.py` | `run_sft()`: tokenizer → dataset → model → trainer → train |
+| Data | `src/llamafactory/data/loader.py` | `get_dataset()` loads/tokenizes datasets (uses `HF_DATASETS_CACHE`) |
+| Model | `src/llamafactory/model/loader.py`, `model/adapter.py` | Loads base model, attaches LoRA adapter |
+| Trainer | `src/llamafactory/train/sft/trainer.py` | `CustomSeq2SeqTrainer` (subclass of `Seq2SeqTrainer`) |
+| DeepSpeed | `examples/deepspeed/ds_z3_config.json` | ZeRO stage 3 config consumed by transformers/accelerate → DeepSpeed engine |
+
+### Call Chain: Full-Parameter Training and Pretraining
+
+The call chain for LoRA vs full-parameter fine-tuning vs pretraining differs only in the dispatch and model/data preparation steps; the DeepSpeed integration is identical in all cases (transformers/accelerate reads the `deepspeed` JSON and wraps the engine).
+
+#### Full-parameter fine-tuning (`finetuning_type: full`) — same chain as LoRA
+
+```bash
+llamafactory-cli train examples/train_full/qwen3_full_sft.yaml                          # ds_z3
+llamafactory-cli train examples/extras/fp8/llama3_fp8_deepspeed_sft.yaml                # ds_z3_fp8
+```
+
+Goes through the exact same `run_sft()` chain as LoRA. Only the internals differ:
+
+| Aspect | LoRA (adapter) | Full (full parameters) |
+|--------|----------------|------------------------|
+| `init_adapter()` | `_setup_lora_tuning`: freezes the base model, wraps it into a `PeftModel` with rank-8 low-rank matrices | `_setup_full_tuning` (`model/adapter.py:38`): no adapter; all params stay trainable except forbidden modules |
+| Trainable params | ~0.3% (adapter only) | 100% (e.g. 7.6B) |
+| Optimizer | contains adapter params only | contains all params; optimizer states/grads fully sharded by ZeRO-3 |
+| Learning rate | 1e-4 | 1e-5 |
+| `save_model()` | saves only the adapter directory | saves full model weights |
+
+#### Pretraining (`stage: pt`) — no built-in full+DeepSpeed script, different chain
+
+Only the LoRA variant exists in-repo ([examples/train_lora/qwen3_lora_pretrain.yaml](examples/train_lora/qwen3_lora_pretrain.yaml), no `deepspeed`). A full-parameter pretrain run can be composed with:
+
+```yaml
+stage: pt
+finetuning_type: full
+deepspeed: examples/deepspeed/ds_z3_config.json
+dataset: c4_demo
+```
+
+Dispatch differs at `src/llamafactory/train/tuner.py`:
+
+| Step | SFT (`stage: sft`) | PT (`stage: pt`) |
+|------|--------------------|------------------|
+| Dispatch | `tuner.py:140` → `run_sft` (`train/sft/workflow.py`) | `tuner.py:138` → `run_pt` (`train/pt/workflow.py:36`) |
+| Data | chat template formatting (e.g. `qwen3_nothink`) | no template; raw text continuation (`c4_demo`) |
+| Collator | `SFTDataCollatorWith4DAttentionMask` | `DataCollatorForLanguageModeling(mlm=False)` |
+| Trainer | `CustomSeq2SeqTrainer` | `CustomTrainer` (`train/pt/trainer.py`) |
+| Upstream | `cli.py → launcher → run_exp → get_train_args → load_tokenizer → get_dataset → load_model → trainer.train()` identical for both | same as SFT |
+
+Also note `load_model` has a special branch: setting `train_from_scratch: true` initializes the model via `load_class.from_config(config)` (random weights) instead of `from_pretrained` (pretrained weights), which is the true from-scratch training path.
+
+### Call Chain: Checkpoint (ckpt) Behavior under DeepSpeed
+
+Once `deepspeed:` is set in the YAML, checkpoint save/restore is delegated to the DeepSpeed engine (verified against transformers 4.57.3 `Trainer`).
+
+#### Save path
+
+```text
+training loop (each step)
+└─ transformers DefaultFlowCallback.on_step_end (trainer_callback.py:579)
+     ├─ save_strategy == STEPS and global_step % save_steps == 0 → control.should_save = True
+     └─ global_step >= max_steps (end of training)               → control.should_save = True
+└─ Trainer._maybe_log_save_evaluate (trainer.py:3227)
+   └─ control.should_save → Trainer._save_checkpoint (trainer.py:3312)
+      ├─ Trainer.save_model(checkpoint-N, _internal_call=True)
+      │  └─ is_deepspeed_enabled → accelerator.get_state_dict(self.deepspeed)  # trainer.py:4210
+      │     (gathers ZeRO-3 shards; requires ds json `stage3_gather_16bit_weights_on_model_save: true`)
+      │     → _save() writes HF sharded safetensors (loadable via from_pretrained)
+      │     (if gather disabled → ValueError branch trainer.py:4215, DeepSpeed raw shards only, recover with zero_to_fp32.py)
+      ├─ _save_optimizer_and_scheduler (trainer.py:3452, skipped if save_only_model)
+      │  └─ self.model_wrapped.save_checkpoint(output_dir)  # DeepSpeed engine
+      │     → checkpoint-N/global_stepN/bf16_zero_pp_rank_{i}_optim_states.pt  (optimizer/scheduler states)
+      │     (LoRA: exclude_frozen_parameters=True, trainer.py:3458)
+      └─ callback_handler.on_save → SaveProcessorCallback (saves processor),
+         FixValueHeadModelCallback (fixes value-head state_dict under ZeRO-3)
+```
+
+#### Resume path
+
+```text
+llamafactory-cli train <yaml>  # resume_from_checkpoint: <dir> / null
+├─ parser.py:639-655: if null and output_dir exists and not overwrite_output_dir
+│  → auto-detect last checkpoint-xxx and set resume_from_checkpoint
+└─ Trainer.train(resume_from_checkpoint=...) (trainer.py:2501)
+   └─ is_deepspeed_enabled → deepspeed_load_checkpoint (integrations/deepspeed.py:485)
+      → engine.load_checkpoint(load_optimizer_states=True, load_lr_scheduler_states=True)
+        # model + optimizer + scheduler restored together
+```
+
+#### YAML keys that influence checkpoints
+
+| Key | Effect |
+|-----|--------|
+| `deepspeed: examples/deepspeed/ds_z3_config.json` | enables DeepSpeed-managed checkpoints |
+| `stage3_gather_16bit_weights_on_model_save` (in ds json) | whether HF-loadable full weights are also written |
+| `output_dir` | checkpoint location (`output_dir/checkpoint-{step}/`) |
+| `save_steps` / `save_strategy` | trigger frequency (steps / epoch / best) |
+| `save_total_limit` | rotate & delete old checkpoints |
+| `save_only_model` | skip optimizer/scheduler/rng states → resume impossible (training_args.py:1029) |
+| `overwrite_output_dir` | allow reusing an existing output dir |
+| `resume_from_checkpoint` | `null` (auto) / `auto` / explicit path |
+
+After training, `workflow.py:122` calls `trainer.save_model()` to additionally write the final adapter/weights to the `output_dir` root.
+
+### Call Chain: Checkpoint Trigger (how periodic save actually fires)
+
+Verified against transformers 4.57.3. The YAML keys `save_strategy` / `save_steps` flow into the loop as follows:
+
+```text
+llamafactory-cli train <yaml>            # save_strategy: steps, save_steps: 200
+└─ hparams/parser.py:get_train_args() → TrainingArguments (transformers)
+└─ workflow.py → CustomSeq2SeqTrainer → trainer.train()
+   └─ Trainer._inner_training_loop
+      ├─ trainer.py:2443: self.state = TrainerState(...); self.state.compute_steps(args, max_steps)
+      │   └─ trainer_callback.py:157 compute_steps(): state.save_steps = args.save_steps  # 200
+      ├─ every optimizer step:
+      │   └─ CallbackHandler.on_step_end → DefaultFlowCallback.on_step_end
+      │      └─ trainer_callback.py:594-600:
+      │         save_strategy == STEPS and state.save_steps > 0
+      │         and state.global_step % state.save_steps == 0 → control.should_save = True
+      │         # global_step == one optimizer step (grad_accum micro-batches already folded)
+      └─ Trainer._maybe_log_save_evaluate (trainer.py:3190, called at :2756 every step)
+         └─ control.should_save → _save_checkpoint (trainer.py:3312)
+            ├─ save_model(checkpoint-N)        # HF sharded weights (deepspeed: gathered from ZeRO-3)
+            ├─ _save_optimizer_and_scheduler   # deepspeed: engine.save_checkpoint → ZeRO/optim shards
+            └─ _rotate_checkpoints             # keeps latest `save_total_limit` checkpoints
+```
+
+Extra guarantees:
+
+- **End-of-training save**: `DefaultFlowCallback.on_step_end` (trainer_callback.py:603-607) forces `control.should_save = True` when `global_step >= max_steps`, so the last checkpoint is always written.
+- **Best checkpoint**: with `save_strategy: best`, `_maybe_log_save_evaluate` (trainer.py:3224-3225) sets `should_save` only when a new best metric appears.
+- **Resume auto-detect**: `hparams/parser.py:639-655` — if `resume_from_checkpoint` is null and `output_dir` exists and `overwrite_output_dir: false`, the last `checkpoint-xxx` is found and used; each checkpoint then loads via `deepspeed_load_checkpoint` (engine.load_checkpoint with optimizer+scheduler states).
+- **Write gating**: actual disk writes are gated by `TrainingArguments.should_save` (training_args.py:2450, main process only), while the DeepSpeed engine path (`save_checkpoint`) must be called by all ranks.
+
 ### Fine-Tuning with LLaMA Board GUI (powered by [Gradio](https://github.com/gradio-app/gradio))
 
 ```bash

@@ -1,0 +1,56 @@
+# Based on examples/train_lora/qwen3_lora_sft_ds3.yaml
+# Checkpoint behavior: save every `save_steps` training steps, keep the latest
+# `save_total_limit` checkpoints, and allow resuming from the last one.
+
+### model
+model_name_or_path: Qwen/Qwen3-4B-Instruct-2507
+trust_remote_code: true
+
+### method
+stage: sft
+do_train: true
+finetuning_type: lora
+lora_rank: 8
+lora_target: all
+deepspeed: examples/deepspeed/ds_z3_config.json  # ZeRO-3, stage3_gather_16bit_weights_on_model_save: true
+
+### dataset
+dataset: identity,alpaca_en_demo
+template: qwen3_nothink
+cutoff_len: 2048
+max_samples: 1000
+preprocessing_num_workers: 16
+dataloader_num_workers: 4
+
+### output
+output_dir: saves/qwen3-4b/lora/sft-ckpt
+logging_steps: 10
+report_to: none
+
+### checkpoint
+save_strategy: steps          # trigger checkpoint per fixed step interval
+save_steps: 200               # save a checkpoint every 200 global steps
+save_total_limit: 3           # keep only the latest 3 checkpoints (rotate old ones)
+save_only_model: false        # also save DeepSpeed optimizer/scheduler states, enabling resume
+save_safetensors: true        # HF-loadable sharded weights in each checkpoint dir
+overwrite_output_dir: true
+resume_from_checkpoint: null  # null: fresh start (auto-detect is skipped due to overwrite_output_dir: true);
+                               # to resume, set `auto` or an explicit checkpoint-xxx path
+plot_loss: true
+
+### train
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 2
+learning_rate: 1.0e-4
+num_train_epochs: 3.0
+lr_scheduler_type: cosine
+warmup_ratio: 0.1
+bf16: true
+ddp_timeout: 180000000
+
+### eval
+# eval_dataset: alpaca_en_demo
+# val_size: 0.1
+# per_device_eval_batch_size: 1
+# eval_strategy: steps
+# eval_steps: 500
